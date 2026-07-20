@@ -183,6 +183,105 @@ docker exec $(docker ps -q -f label=com.docker.swarm.service.name=sol2docker_sol
 
 Change it after logging in, then delete the file.
 
+## Doing it by hand
+
+The installer only writes a compose file and brings it up — nothing stops you writing one
+yourself. Generate a key first, and keep it: losing it makes stored registry and git credentials
+undecryptable.
+
+```bash
+openssl rand -base64 32      # SOL2DOCKER_ENCRYPTION_KEY
+openssl rand -hex 24         # agent token, only if you deploy the agent
+```
+
+### Standalone
+
+```yaml
+# docker-compose.yml
+services:
+  sol2docker:
+    image: ghcr.io/sol2docker/sol2docker:beta
+    container_name: sol2docker
+    ports: ["8080:8080"]
+    environment:
+      SOL2DOCKER_ENCRYPTION_KEY: "paste-the-generated-key"
+      SOL2DOCKER_AGENT_BOOTSTRAP_TOKEN: "paste-the-agent-token"   # only with the agent
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/data
+    restart: unless-stopped
+
+  agent:                                                # optional
+    image: ghcr.io/sol2docker/agent:beta
+    environment:
+      SOL2DOCKER_SERVER_URL: "http://sol2docker:8080"
+      SOL2DOCKER_AGENT_TOKEN: "paste-the-agent-token"   # same value as the server's
+      SOL2DOCKER_INSECURE_HTTP: "true"                  # required — see below
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d          # → http://localhost:8080
+```
+
+### Swarm
+
+Same idea, plus `deploy:` blocks and a shared overlay. Run `docker stack deploy` **on the manager
+that should hold the data**:
+
+```yaml
+# docker-stack.yml
+services:
+  sol2docker:
+    image: ghcr.io/sol2docker/sol2docker:beta
+    ports: ["8080:8080"]
+    environment:
+      SOL2DOCKER_ENCRYPTION_KEY: "paste-the-generated-key"
+      SOL2DOCKER_AGENT_BOOTSTRAP_TOKEN: "paste-the-agent-token"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/sol2docker:/data
+    networks: [sol2docker]
+    deploy:
+      placement:
+        constraints: [node.hostname == THIS-MANAGER]   # see below
+  agent:
+    image: ghcr.io/sol2docker/agent:beta
+    environment:
+      SOL2DOCKER_SERVER_URL: "http://sol2docker:8080"
+      SOL2DOCKER_AGENT_TOKEN: "paste-the-agent-token"
+      SOL2DOCKER_INSECURE_HTTP: "true"
+      SOL2DOCKER_NODE_NAME: "{{.Node.Hostname}}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [sol2docker]
+    deploy:
+      mode: global
+
+networks: { sol2docker: { driver: overlay } }
+```
+
+```bash
+docker stack deploy -c docker-stack.yml sol2docker
+```
+
+### Two things that catch people out
+
+**The agent needs `SOL2DOCKER_INSECURE_HTTP: "true"`.** It refuses plain `http://` to anything
+that isn't loopback, and `sol2docker` is a service name. Without it the agent exits at startup
+and crash-loops. (Use `https://` and you don't need it.)
+
+**Pin the swarm placement to a real hostname.** With `node.role == manager`, a reschedule can move
+the service to a different manager and start it against an empty `/data` — which looks exactly
+like losing your database. Replace `THIS-MANAGER` with the output of `docker info -f '{{.Name}}'`
+on the node you deploy from.
+
+Everything else is optional: TLS (`SOL2DOCKER_TLS=on` plus cert paths), a health check probing
+`/api/v2/ping`, and a second network for a reverse proxy. The installer just fills those in for
+you — see [What it writes](#what-it-writes).
+
 ## Requirements
 
 - **Docker** — if it's missing on Linux, the installer offers to run the official
