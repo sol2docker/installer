@@ -1,0 +1,4 @@
+# Target the POSIX-ish bash 3.2 subset the script is written against.
+shell=bash
+# The script is intentionally one file; sourcing is not used.
+disable=SC1091
