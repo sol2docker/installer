@@ -430,6 +430,17 @@ preflight() {
     standalone) ok "swarm: not enabled (standalone engine)" ;;
   esac
 
+  # Host capacity, read from the engine (so it reflects where the containers actually run —
+  # e.g. the Docker Desktop / colima VM, not the laptop). Used in render() to decide whether the
+  # resource caps are affordable. Integer bytes → MiB; guard against non-numeric output.
+  _mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
+  _ncpu=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)
+  case "$_mem_bytes" in ''|*[!0-9]*) _mem_bytes=0 ;; esac
+  case "$_ncpu" in ''|*[!0-9]*) _ncpu=0 ;; esac
+  HOST_MEM_MB=$(( _mem_bytes / 1048576 ))
+  HOST_NCPU=$_ncpu
+  ok "host capacity: ${HOST_MEM_MB} MiB RAM, ${HOST_NCPU} CPU (engine)"
+
 }
 
 # Existing install? The deployment directory is the source of truth, not docker ps: a container
@@ -472,6 +483,19 @@ DATA_PATH=""
 IMAGE_TAG=""
 WITH_AGENT=0
 PIN_PLATFORM=""
+
+# Resource caps. Safe ceilings, not requirements — sol2docker's real footprint is tiny (server
+# ~50 MiB steady / ~165 MiB peak at boot, agent ~5 MiB). Only pinned when the engine host can
+# afford them (see the LIMITS_OK decision in render()); otherwise we deploy uncapped.
+LIMITS_OK=0
+HOST_MEM_MB=0
+HOST_NCPU=0
+SERVER_CPU_LIMIT="1.0"
+SERVER_MEM_LIMIT="512M"
+SERVER_MEM_RES="128M"
+AGENT_CPU_LIMIT="0.5"
+AGENT_MEM_LIMIT="128M"
+AGENT_MEM_RES="32M"
 
 gen_key() { openssl rand -base64 32 2>/dev/null | tr -d '\n'; }
 gen_token() { openssl rand -hex 24 2>/dev/null | tr -d '\n'; }
@@ -697,6 +721,50 @@ add_env() {
 }
 
 render() {
+  # Decide whether to pin resource caps. Require real headroom over the caps we'd impose (the
+  # sum of memory limits plus room for the OS/daemon) and at least one full CPU; otherwise skip
+  # them and deploy uncapped — "run with whatever the host has". A host that doesn't report
+  # MemTotal (HOST_MEM_MB=0) also falls through to uncapped, which is the safe default.
+  _need_mb=768                                    # 512M server cap + 256M OS/daemon headroom
+  [ "$WITH_AGENT" -eq 1 ] && _need_mb=$(( _need_mb + 128 ))   # + 128M agent cap
+  if [ "$HOST_MEM_MB" -ge "$_need_mb" ] && [ "$HOST_NCPU" -ge 1 ]; then
+    LIMITS_OK=1
+  else
+    LIMITS_OK=0
+  fi
+
+  # The `resources:` sub-block (6-space indent, sits under a service's `deploy:`) for each
+  # service — empty when caps are skipped. docker compose v2 honours deploy.resources.limits in
+  # standalone too, so the same block works for compose and swarm.
+  _res_server=""
+  _res_agent=""
+  _deploy_server=""
+  _deploy_agent=""
+  if [ "$LIMITS_OK" -eq 1 ]; then
+    _res_server="      resources:
+        limits:
+          cpus: \"${SERVER_CPU_LIMIT}\"
+          memory: ${SERVER_MEM_LIMIT}
+        reservations:
+          memory: ${SERVER_MEM_RES}
+"
+    _res_agent="      resources:
+        limits:
+          cpus: \"${AGENT_CPU_LIMIT}\"
+          memory: ${AGENT_MEM_LIMIT}
+        reservations:
+          memory: ${AGENT_MEM_RES}
+"
+    # Standalone services have no other `deploy:` keys, so they need the wrapper too.
+    _deploy_server="    deploy:
+${_res_server}"
+    _deploy_agent="    deploy:
+${_res_agent}"
+    info "resource limits: server ${SERVER_MEM_LIMIT}/${SERVER_CPU_LIMIT}CPU$([ "$WITH_AGENT" -eq 1 ] && printf ', agent %s/%sCPU' "$AGENT_MEM_LIMIT" "$AGENT_CPU_LIMIT")"
+  else
+    info "resource limits: skipped — host ${HOST_MEM_MB} MiB / ${HOST_NCPU} CPU below the ${_need_mb} MiB needed; deploying uncapped"
+  fi
+
   _svc_env=""
   add_env SOL2DOCKER_ENCRYPTION_KEY "$ENC_KEY"
   add_env SOL2DOCKER_ADMIN_USER "$ADMIN_USER"
@@ -755,7 +823,7 @@ render() {
       mode: global
       restart_policy:
         condition: any
-"
+${_res_agent}"
     else
       _agent_block="
   agent:
@@ -770,7 +838,7 @@ render() {
       - ${DOCKER_SOCK}:/var/run/docker.sock:ro
     depends_on: [sol2docker]
     restart: unless-stopped
-"
+${_deploy_agent}"
     fi
   fi
 
@@ -857,7 +925,7 @@ ${_svc_vols}${_svc_nets}${_health_block}    deploy:
         constraints: [${_placement_constraint}]
       restart_policy:
         condition: any
-${_agent_block}
+${_res_server}${_agent_block}
 networks:
   sol2docker:
     driver: overlay
@@ -874,7 +942,7 @@ services:
 ${_ports_block}    environment:
 ${_svc_env}    volumes:
 ${_svc_vols}${_svc_nets}${_health_block}    restart: unless-stopped
-${_agent_block}"
+${_deploy_server}${_agent_block}"
     if [ -n "$EXTRA_NET" ]; then
       COMPOSE_BODY="${COMPOSE_BODY}
 networks:
