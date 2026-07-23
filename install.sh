@@ -435,9 +435,9 @@ preflight() {
   # resource caps are affordable. Integer bytes → MiB; guard against non-numeric output.
   _mem_bytes=$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)
   _ncpu=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)
-  case "$_mem_bytes" in ''|*[!0-9]*) _mem_bytes=0 ;; esac
-  case "$_ncpu" in ''|*[!0-9]*) _ncpu=0 ;; esac
-  HOST_MEM_MB=$(( _mem_bytes / 1048576 ))
+  case "$_mem_bytes" in '' | *[!0-9]*) _mem_bytes=0 ;; esac
+  case "$_ncpu" in '' | *[!0-9]*) _ncpu=0 ;; esac
+  HOST_MEM_MB=$((_mem_bytes / 1048576))
   HOST_NCPU=$_ncpu
   ok "host capacity: ${HOST_MEM_MB} MiB RAM, ${HOST_NCPU} CPU (engine)"
 
@@ -483,6 +483,16 @@ DATA_PATH=""
 IMAGE_TAG=""
 WITH_AGENT=0
 PIN_PLATFORM=""
+PUBLIC_URL=""
+WITH_SSO=0
+OIDC_ONLY=0
+OIDC_ISSUER=""
+OIDC_CLIENT_ID=""
+OIDC_CLIENT_SECRET=""
+OIDC_PROVIDER_NAME=""
+OIDC_SCOPES=""
+OIDC_GROUPS_CLAIM=""
+OIDC_DEFAULT_ROLE=""
 
 # Resource caps. Safe ceilings, not requirements — sol2docker's real footprint is tiny (server
 # ~50 MiB steady / ~165 MiB peak at boot, agent ~5 MiB). Only pinned when the engine host can
@@ -642,9 +652,43 @@ gather() {
       ;;
   esac
 
+  # --- public URL. Behind a reverse proxy the request reaches Sol2Docker as plain http on an
+  # internal host, so URLs it builds (the OIDC callback + post-logout redirect) come out wrong.
+  # Setting the external URL fixes them. Asked whenever TLS isn't 'none' (i.e. there's a front end).
+  if [ "$TLS_MODE" != "none" ]; then
+    ask PUBLIC_URL "Public URL users reach Sol2Docker at, e.g. https://sol2docker.example.com (blank = derive per request)" ""
+  fi
+
   # --- admin
   ask ADMIN_USER "Admin username" "admin"
   ask_secret ADMIN_PASS "Admin password (blank = generated on first boot)"
+
+  # --- single sign-on (OIDC, optional)
+  head2 "Single sign-on (OIDC, optional)"
+  info "Let people sign in through your identity provider (Keycloak, Authentik, Google, Okta, …)."
+  info "Sol2Docker works fully without it — local accounts stay available."
+  if confirm "Set up single sign-on (OIDC) now?" n; then
+    WITH_SSO=1
+    ask OIDC_ISSUER "Issuer URL (its /.well-known/openid-configuration must resolve)" ""
+    ask OIDC_CLIENT_ID "Client ID registered with the provider" ""
+    ask_secret OIDC_CLIENT_SECRET "Client secret"
+    [ -n "$OIDC_ISSUER" ] && [ -n "$OIDC_CLIENT_ID" ] && [ -n "$OIDC_CLIENT_SECRET" ] ||
+      die "Issuer, client ID and client secret are all required for SSO."
+    ask OIDC_PROVIDER_NAME "Name shown on the login button" "SSO"
+    ask OIDC_SCOPES "Scopes (space-separated; add one that emits the groups/roles claim)" "openid profile email"
+    ask OIDC_GROUPS_CLAIM "Groups/roles claim path (e.g. groups, or resource_access.<client>.roles)" "groups"
+    choose OIDC_DEFAULT_ROLE "Fallback role for a new SSO user when no group mapping matches" \
+      "environment_viewer" environment_viewer environment_operator platform_operator platform_admin none
+    # The exact redirect URI the provider must allow.
+    _cb_base="${PUBLIC_URL:-<your Sol2Docker URL>}"
+    info "Register this redirect URI at your provider:"
+    info "  ${_cb_base%/}/api/v2/auth/oidc/callback"
+    if confirm "Make login OIDC-only (turn off local username/password)?" n; then
+      OIDC_ONLY=1
+      [ "$OIDC_DEFAULT_ROLE" = "platform_admin" ] ||
+        warn "OIDC-only + local login off: make sure an SSO user gets platform_admin (a default role or group mapping) or you'll be locked out."
+    fi
+  fi
 
   # --- encryption key: never regenerate over an existing install
   if ENC_KEY=$(existing_value SOL2DOCKER_ENCRYPTION_KEY); then
@@ -725,8 +769,8 @@ render() {
   # sum of memory limits plus room for the OS/daemon) and at least one full CPU; otherwise skip
   # them and deploy uncapped — "run with whatever the host has". A host that doesn't report
   # MemTotal (HOST_MEM_MB=0) also falls through to uncapped, which is the safe default.
-  _need_mb=768                                    # 512M server cap + 256M OS/daemon headroom
-  [ "$WITH_AGENT" -eq 1 ] && _need_mb=$(( _need_mb + 128 ))   # + 128M agent cap
+  _need_mb=768                                            # 512M server cap + 256M OS/daemon headroom
+  [ "$WITH_AGENT" -eq 1 ] && _need_mb=$((_need_mb + 128)) # + 128M agent cap
   if [ "$HOST_MEM_MB" -ge "$_need_mb" ] && [ "$HOST_NCPU" -ge 1 ]; then
     LIMITS_OK=1
   else
@@ -782,6 +826,19 @@ ${_res_agent}"
       add_env SOL2DOCKER_TRUST_PROXY true
       ;;
   esac
+
+  [ -n "$PUBLIC_URL" ] && add_env SOL2DOCKER_PUBLIC_URL "$PUBLIC_URL"
+
+  if [ "$WITH_SSO" -eq 1 ]; then
+    add_env SOL2DOCKER_OIDC_ISSUER "$OIDC_ISSUER"
+    add_env SOL2DOCKER_OIDC_CLIENT_ID "$OIDC_CLIENT_ID"
+    add_env SOL2DOCKER_OIDC_CLIENT_SECRET "$OIDC_CLIENT_SECRET"
+    add_env SOL2DOCKER_OIDC_PROVIDER_NAME "$OIDC_PROVIDER_NAME"
+    add_env SOL2DOCKER_OIDC_SCOPES "$OIDC_SCOPES"
+    add_env SOL2DOCKER_OIDC_GROUPS_CLAIM "$OIDC_GROUPS_CLAIM"
+    [ "$OIDC_DEFAULT_ROLE" != "none" ] && add_env SOL2DOCKER_OIDC_DEFAULT_ROLE "$OIDC_DEFAULT_ROLE"
+    [ "$OIDC_ONLY" -eq 1 ] && add_env SOL2DOCKER_DISABLE_LOCAL_LOGIN true
+  fi
 
   # volumes
   _z=""
@@ -981,6 +1038,12 @@ review() {
   printf '  %-22s %s\n' "tls" "$TLS_MODE"
   printf '  %-22s %s\n' "admin user" "$ADMIN_USER"
   printf '  %-22s %s\n' "admin password" "$([ -n "$ADMIN_PASS" ] && echo '<set by you>' || echo 'generated on first boot')"
+  [ -n "$PUBLIC_URL" ] && printf '  %-22s %s\n' "public url" "$PUBLIC_URL"
+  if [ "$WITH_SSO" -eq 1 ]; then
+    printf '  %-22s %s\n' "single sign-on" "$OIDC_PROVIDER_NAME ($OIDC_ISSUER)$([ "$OIDC_ONLY" -eq 1 ] && echo ' — OIDC-only')"
+  else
+    printf '  %-22s %s\n' "single sign-on" "no"
+  fi
   printf '  %-22s %s\n' "encryption key" "$(mask "$ENC_KEY")"
   printf '  %-22s %s\n' "data" "$([ "$DATA_MODE" = bind-mount ] && echo "$DATA_PATH" || echo 'named volume sol2docker-data')"
   if [ "$TOPOLOGY" = "swarm" ]; then
@@ -995,6 +1058,7 @@ review() {
   _preview="$COMPOSE_BODY"
   _preview=$(printf '%s\n' "$_preview" | sed "s|${ENC_KEY}|<encryption-key>|g")
   [ -n "$AGENT_TOKEN" ] && _preview=$(printf '%s\n' "$_preview" | sed "s|${AGENT_TOKEN}|<agent-token>|g")
+  [ -n "$OIDC_CLIENT_SECRET" ] && _preview=$(printf '%s\n' "$_preview" | sed "s|${OIDC_CLIENT_SECRET}|<oidc-client-secret>|g")
   printf '%s\n' "$_preview" | sed 's/^/  /'
 }
 
